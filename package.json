@@ -1,0 +1,26 @@
+{
+  "name": "video-render-service",
+  "version": "1.0.0",
+  "description": "Production-grade FFmpeg-based video rendering microservice for automated YouTube content pipelines. Handles Ken Burns pan/zoom effects and animated text motion graphics.",
+  "main": "server.js",
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "scripts": {
+    "start": "node server.js"
+  },
+  "keywords": [
+    "ffmpeg",
+    "video-rendering",
+    "ken-burns",
+    "motion-graphics",
+    "automation"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "fluent-ffmpeg": "^2.1.3",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
+  }
+}
