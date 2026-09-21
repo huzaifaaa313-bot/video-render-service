@@ -1,8 +1,9 @@
 // ============================================================
-// UNIVERSAL VIDEO & AUDIO RENDER MICROSERVICE — v5
-// Ken Burns, text motion graphics, Edge TTS (chunked + concatenated).
-// Voice/rate/pitch decisions live in n8n — this service only renders,
-// but validates whatever it receives before trusting it.
+// UNIVERSAL VIDEO & AUDIO RENDER MICROSERVICE — v6
+// Ken Burns (URL or base64 image source), text motion graphics,
+// Edge TTS (chunked + concatenated). Voice/rate/pitch decisions
+// live in n8n — this service only renders, but validates
+// whatever it receives before trusting it.
 // ============================================================
 
 const express = require('express');
@@ -16,7 +17,7 @@ const { EdgeTTS } = require('node-edge-tts');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '5mb' }));
+app.use(express.json({ limit: '15mb' })); // raised for base64 image payloads
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.RENDER_API_SECRET;
@@ -30,7 +31,6 @@ let activeTtsJobs = 0;
 
 function logEvent(id, msg) { console.log(`[${new Date().toISOString()}] [${id}] ${msg}`); }
 
-// Sweep any temp files left behind by a crashed/restarted process.
 (function cleanupStaleTempFilesOnStartup() {
 	const cutoff = Date.now() - 10 * 60 * 1000;
 	fs.readdir(os.tmpdir(), (err, files) => {
@@ -54,6 +54,7 @@ const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
 const RATE_REGEX = /^[+-]\d{1,3}%$/;
 const PITCH_REGEX = /^[+-]\d{1,3}Hz$/;
 const VOICE_REGEX = /^[a-z]{2,3}-[A-Z]{2}-[A-Za-z]+Neural$/i;
+const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
 const MAX_TEXT_LENGTH = 200;
 const MAX_TTS_TEXT_LENGTH = 50000;
 
@@ -62,6 +63,7 @@ function validateColor(v, fb) { return v && HEX_COLOR_REGEX.test(v) ? v : fb; }
 function validateRate(v) { return v && RATE_REGEX.test(v) ? v : '+0%'; }
 function validatePitch(v) { return v && PITCH_REGEX.test(v) ? v : '+0Hz'; }
 function validateVoice(v) { return v && VOICE_REGEX.test(v) ? v : null; }
+function isValidBase64(v) { return typeof v === 'string' && v.length > 100 && BASE64_REGEX.test(v); }
 
 function makeTempPath(id, ext, suffix = '') { return path.join(os.tmpdir(), `${TEMP_PREFIX}${id}_${suffix}${crypto.randomBytes(4).toString('hex')}.${ext}`); }
 
@@ -92,9 +94,17 @@ function buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps
 	return `zoompan=z='${zoomExpr}':x='${pan.x}':y='${pan.y}':d=${totalFrames}:s=1920x1080:fps=${fps}`;
 }
 
-async function renderKenBurns({ imageUrl, durationSeconds, zoomDirection, panDirection, requestId }, outputPath) {
+// Accepts EITHER a downloadable imageUrl OR raw imageBase64 (e.g. from
+// Gemini's inline image response) — exactly one source is used.
+async function renderKenBurns({ imageUrl, imageBase64, durationSeconds, zoomDirection, panDirection, requestId }, outputPath) {
 	const inputPath = makeTempPath(requestId, 'jpg', 'kb_src_');
-	await downloadToFile(imageUrl, inputPath);
+
+	if (imageBase64) {
+		fs.writeFileSync(inputPath, Buffer.from(imageBase64, 'base64'));
+	} else {
+		await downloadToFile(imageUrl, inputPath);
+	}
+
 	const fps = 30;
 	const filter = buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps });
 	await new Promise((resolve, reject) => {
@@ -191,10 +201,21 @@ app.post('/render', requireApiSecret, async (req, res) => {
 
 	try {
 		if (type === 'kenburns') {
-			const { image_url, duration, zoom, pan } = req.body;
-			if (!image_url || !isValidHttpUrl(image_url)) return res.status(400).json({ error: 'VALIDATION_ERROR: "image_url" must be a valid http(s) URL.', request_id: requestId });
+			const { image_url, image_base64, duration, zoom, pan } = req.body;
+
+			if (!image_url && !image_base64) {
+				return res.status(400).json({ error: 'VALIDATION_ERROR: provide either "image_url" or "image_base64".', request_id: requestId });
+			}
+			if (image_url && !isValidHttpUrl(image_url)) {
+				return res.status(400).json({ error: 'VALIDATION_ERROR: "image_url" must be a valid http(s) URL.', request_id: requestId });
+			}
+			if (image_base64 && !isValidBase64(image_base64)) {
+				return res.status(400).json({ error: 'VALIDATION_ERROR: "image_base64" does not look like valid base64 data.', request_id: requestId });
+			}
+
 			await renderKenBurns({
 				imageUrl: image_url,
+				imageBase64: image_base64,
 				durationSeconds: Math.max(2, Math.min(20, Number(duration) || 6)),
 				zoomDirection: zoom === 'out' ? 'out' : 'in',
 				panDirection: ['right', 'left', 'top', 'bottom'].includes(pan) ? pan : 'right',
