@@ -1,12 +1,11 @@
 // ============================================================
-// UNIVERSAL VIDEO & AUDIO RENDER MICROSERVICE — v6
-// Ken Burns (URL or base64 image source), text motion graphics,
-// Edge TTS (chunked + concatenated). Voice/rate/pitch decisions
-// live in n8n — this service only renders, but validates
-// whatever it receives before trusting it.
+// UNIVERSAL VIDEO & AUDIO RENDER + ASSEMBLY MICROSERVICE — v8
+// Job/shot-scoped storage, per-shot mux+subtitle-burn+normalize,
+// codec-safe final concatenation. Replaces Shotstack entirely.
 // ============================================================
 
 const express = require('express');
+const multer = require('multer');
 const ffmpeg = require('fluent-ffmpeg');
 const axios = require('axios');
 const fs = require('fs');
@@ -17,70 +16,142 @@ const { EdgeTTS } = require('node-edge-tts');
 require('dotenv').config();
 
 const app = express();
-app.use(express.json({ limit: '15mb' })); // raised for base64 image payloads
+app.use(express.json({ limit: '15mb' }));
+const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB cap per file
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.RENDER_API_SECRET;
 const FONT_PATH = process.env.FONT_PATH || '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf';
-const TEMP_PREFIX = 'render_';
+const TARGET_W = 1920, TARGET_H = 1080, TARGET_FPS = 30;
 
-const MAX_CONCURRENT_VIDEO_RENDERS = 2;
-const MAX_CONCURRENT_TTS = 3;
-let activeVideoRenders = 0;
-let activeTtsJobs = 0;
-
-function logEvent(id, msg) { console.log(`[${new Date().toISOString()}] [${id}] ${msg}`); }
-
-(function cleanupStaleTempFilesOnStartup() {
-	const cutoff = Date.now() - 10 * 60 * 1000;
-	fs.readdir(os.tmpdir(), (err, files) => {
-		if (err) return;
-		for (const f of files) {
-			if (!f.startsWith(TEMP_PREFIX)) continue;
-			const full = path.join(os.tmpdir(), f);
-			fs.stat(full, (e, stat) => { if (!e && stat.mtimeMs < cutoff) fs.unlink(full, () => {}); });
-		}
-	});
-})();
-
+// ------------------------------------------------------------ SECURITY
 function requireApiSecret(req, res, next) {
 	const provided = req.header('x-api-secret');
-	if (!API_SECRET) return res.status(500).json({ error: 'SERVER_MISCONFIGURED: RENDER_API_SECRET is not set.' });
-	if (!provided || provided !== API_SECRET) return res.status(401).json({ error: 'UNAUTHORIZED: missing or invalid x-api-secret header.' });
+	if (!API_SECRET) return res.status(500).json({ error: 'SERVER_MISCONFIGURED: RENDER_API_SECRET not set.' });
+	if (!provided || provided !== API_SECRET) return res.status(401).json({ error: 'UNAUTHORIZED: missing/invalid x-api-secret header.' });
 	next();
 }
 
-const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
-const RATE_REGEX = /^[+-]\d{1,3}%$/;
-const PITCH_REGEX = /^[+-]\d{1,3}Hz$/;
-const VOICE_REGEX = /^[a-z]{2,3}-[A-Z]{2}-[A-Za-z]+Neural$/i;
-const BASE64_REGEX = /^[A-Za-z0-9+/]+={0,2}$/;
-const MAX_TEXT_LENGTH = 200;
-const MAX_TTS_TEXT_LENGTH = 50000;
+function logEvent(id, msg) { console.log(`[${new Date().toISOString()}] [${id}] ${msg}`); }
 
-function isValidHttpUrl(v) { try { const p = new URL(v); return p.protocol === 'http:' || p.protocol === 'https:'; } catch { return false; } }
-function validateColor(v, fb) { return v && HEX_COLOR_REGEX.test(v) ? v : fb; }
-function validateRate(v) { return v && RATE_REGEX.test(v) ? v : '+0%'; }
-function validatePitch(v) { return v && PITCH_REGEX.test(v) ? v : '+0Hz'; }
-function validateVoice(v) { return v && VOICE_REGEX.test(v) ? v : null; }
-function isValidBase64(v) { return typeof v === 'string' && v.length > 100 && BASE64_REGEX.test(v); }
+// Basic SSRF guard: refuse to fetch from private/loopback hosts.
+const PRIVATE_HOST_REGEX = /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.0|::1)/i;
+function isSafeExternalUrl(url) {
+	try {
+		const u = new URL(url);
+		if (!['http:', 'https:'].includes(u.protocol)) return false;
+		if (PRIVATE_HOST_REGEX.test(u.hostname)) return false;
+		return true;
+	} catch { return false; }
+}
 
-function makeTempPath(id, ext, suffix = '') { return path.join(os.tmpdir(), `${TEMP_PREFIX}${id}_${suffix}${crypto.randomBytes(4).toString('hex')}.${ext}`); }
+// ------------------------------------------------------------ JOB STORE (path-safe)
+const JOB_STORE_ROOT = path.join(os.tmpdir(), 'job_store');
+if (!fs.existsSync(JOB_STORE_ROOT)) fs.mkdirSync(JOB_STORE_ROOT, { recursive: true });
 
-async function downloadToFile(url, dest) {
-	const res = await axios({ method: 'GET', url, responseType: 'stream', timeout: 30000, maxContentLength: 25 * 1024 * 1024 });
-	await new Promise((resolve, reject) => {
-		const w = fs.createWriteStream(dest);
-		res.data.pipe(w);
-		w.on('finish', resolve); w.on('error', reject); res.data.on('error', reject);
+function safeId(id) {
+	const clean = String(id || '').replace(/[^a-zA-Z0-9_-]/g, '_');
+	if (!clean) throw new Error('INVALID_ID: id is empty after sanitization.');
+	return clean;
+}
+
+function jobPath(jobId, ...segments) {
+	const base = path.join(JOB_STORE_ROOT, safeId(jobId));
+	const full = path.join(base, ...segments.map(safeId_or_file));
+	const resolvedBase = path.resolve(base);
+	const resolvedFull = path.resolve(full);
+	if (!resolvedFull.startsWith(resolvedBase)) throw new Error('PATH_TRAVERSAL_BLOCKED');
+	return resolvedFull;
+}
+function safeId_or_file(s) {
+	// allows subfolder names and "shotid.ext" filenames, still strips traversal chars
+	return String(s).replace(/[^a-zA-Z0-9_.\-]/g, '_');
+}
+
+function ensureJobDirs(jobId) {
+	for (const sub of ['assets', 'audio', 'subtitles', 'shots', 'final', 'temp']) {
+		const p = jobPath(jobId, sub);
+		if (!fs.existsSync(p)) fs.mkdirSync(p, { recursive: true });
+	}
+}
+
+function cleanupJob(jobId) {
+	const base = jobPath(jobId);
+	fs.rm(base, { recursive: true, force: true }, () => {});
+}
+
+// ------------------------------------------------------------ BOUNDED CONCURRENCY (semaphore + 429)
+function makeGate(maxConcurrent) {
+	let active = 0;
+	return {
+		tryEnter() { if (active >= maxConcurrent) return false; active++; return true; },
+		leave() { active = Math.max(0, active - 1); },
+		get active() { return active; }
+	};
+}
+const renderGate = makeGate(2);
+const ttsGate = makeGate(3);
+const assembleGate = makeGate(1); // assembly is heavy; one at a time
+
+function busyResponse(res, requestId, retryAfterSeconds = 10) {
+	res.setHeader('Retry-After', String(retryAfterSeconds));
+	return res.status(429).json({ error: 'SERVER_BUSY: capacity reached.', retry_after_seconds: retryAfterSeconds, request_id: requestId });
+}
+
+// ------------------------------------------------------------ FFMPEG HELPERS
+function runFfmpeg(build, timeoutMs, requestId) {
+	return new Promise((resolve, reject) => {
+		const cmd = build(ffmpeg());
+		let stderr = '';
+		const t = setTimeout(() => { cmd.kill('SIGKILL'); reject(new Error(`FFMPEG_TIMEOUT after ${timeoutMs}ms`)); }, timeoutMs);
+		cmd
+			.on('stderr', (line) => { stderr += line + '\n'; })
+			.on('end', () => { clearTimeout(t); resolve(); })
+			.on('error', (err) => { clearTimeout(t); reject(new Error(`${err.message} | ffmpeg stderr tail: ${stderr.slice(-500)}`)); })
+			.run();
 	});
 }
 
-function cleanupFiles(id, ...paths) {
-	for (const f of paths) fs.unlink(f, (err) => { if (err && err.code !== 'ENOENT') logEvent(id, `WARNING: cleanup failed for ${f}: ${err.message}`); });
+function probeDuration(filePath) {
+	return new Promise((resolve, reject) => {
+		ffmpeg.ffprobe(filePath, (err, data) => {
+			if (err) return reject(new Error(`FFPROBE_FAILED: ${err.message}`));
+			const duration = data?.format?.duration;
+			if (!duration || duration <= 0) return reject(new Error('FFPROBE_FAILED: no valid duration found.'));
+			resolve(duration);
+		});
+	});
 }
 
-// ------------------------------------------------------------ KEN BURNS
+function validateMediaFile(filePath, expectKind) {
+	return new Promise((resolve, reject) => {
+		if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
+			return reject(new Error('FILE_INVALID: missing or empty file.'));
+		}
+		if (expectKind === 'subtitle') return resolve(true); // text file, no ffprobe needed
+		ffmpeg.ffprobe(filePath, (err, data) => {
+			if (err) return reject(new Error(`FILE_INVALID: not a readable media file (${err.message}).`));
+			const streams = data?.streams || [];
+			if (expectKind === 'video' && !streams.some((s) => s.codec_type === 'video')) return reject(new Error('FILE_INVALID: no video stream found.'));
+			if (expectKind === 'audio' && !streams.some((s) => s.codec_type === 'audio')) return reject(new Error('FILE_INVALID: no audio stream found.'));
+			resolve(true);
+		});
+	});
+}
+
+async function downloadToFile(url, destPath, timeoutMs = 30000) {
+	if (!isSafeExternalUrl(url)) throw new Error('UNSAFE_URL: refused to fetch this URL.');
+	const res = await axios({ method: 'GET', url, responseType: 'stream', timeout: timeoutMs, maxContentLength: 100 * 1024 * 1024, maxRedirects: 5 });
+	const contentType = res.headers['content-type'] || '';
+	await new Promise((resolve, reject) => {
+		const w = fs.createWriteStream(destPath);
+		res.data.pipe(w);
+		w.on('finish', resolve); w.on('error', reject); res.data.on('error', reject);
+	});
+	return contentType;
+}
+
+// ------------------------------------------------------------ KEN BURNS / TEXT MOTION (unchanged behavior, now job-aware)
 function buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps }) {
 	const totalFrames = Math.round(durationSeconds * fps);
 	const zoomExpr = zoomDirection === 'out' ? `if(lte(zoom,1.0),1.3,max(1.001,zoom-0.0008))` : `min(zoom+0.0008,1.3)`;
@@ -91,46 +162,29 @@ function buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps
 		bottom: { x: `iw/2-(iw/zoom/2)`, y: `(ih-ih/zoom)*on/${totalFrames}` }
 	};
 	const pan = panMap[panDirection] || panMap.right;
-	return `zoompan=z='${zoomExpr}':x='${pan.x}':y='${pan.y}':d=${totalFrames}:s=1920x1080:fps=${fps}`;
+	return `zoompan=z='${zoomExpr}':x='${pan.x}':y='${pan.y}':d=${totalFrames}:s=${TARGET_W}x${TARGET_H}:fps=${fps}`;
 }
 
-// Accepts EITHER a downloadable imageUrl OR raw imageBase64 (e.g. from
-// Gemini's inline image response) — exactly one source is used.
 async function renderKenBurns({ imageUrl, imageBase64, durationSeconds, zoomDirection, panDirection, requestId }, outputPath) {
-	const inputPath = makeTempPath(requestId, 'jpg', 'kb_src_');
-
-	if (imageBase64) {
-		fs.writeFileSync(inputPath, Buffer.from(imageBase64, 'base64'));
-	} else {
-		await downloadToFile(imageUrl, inputPath);
-	}
-
-	const fps = 30;
-	const filter = buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps });
-	await new Promise((resolve, reject) => {
-		const cmd = ffmpeg(inputPath).loop(durationSeconds).videoFilters(filter)
-			.outputOptions(['-pix_fmt yuv420p', '-movflags +faststart']).duration(durationSeconds).fps(fps).output(outputPath);
-		const t = setTimeout(() => { cmd.kill('SIGKILL'); reject(new Error('RENDER_TIMEOUT: Ken Burns exceeded 60s.')); }, 60000);
-		cmd.on('end', () => { clearTimeout(t); resolve(); }).on('error', (e) => { clearTimeout(t); reject(e); }).run();
-	});
-	cleanupFiles(requestId, inputPath);
+	const inputPath = outputPath + '.src.jpg';
+	if (imageBase64) fs.writeFileSync(inputPath, Buffer.from(imageBase64, 'base64'));
+	else await downloadToFile(imageUrl, inputPath);
+	const filter = buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps: TARGET_FPS });
+	await runFfmpeg((c) => c.input(inputPath).loop(durationSeconds).videoFilters(filter)
+		.outputOptions(['-pix_fmt yuv420p', '-movflags +faststart']).duration(durationSeconds).fps(TARGET_FPS).output(outputPath), 60000, requestId);
+	fs.unlink(inputPath, () => {});
 }
 
-// ------------------------------------------------------------ TEXT MOTION
 function escapeForDrawtext(t) { return String(t).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, '\u2019').replace(/%/g, '\\%'); }
 
 async function renderTextMotion({ text, durationSeconds, backgroundColor, fontColor, requestId }, outputPath) {
 	const safeText = escapeForDrawtext(text);
-	const fps = 30, fadeInEnd = 0.6, fadeOutStart = Math.max(fadeInEnd, durationSeconds - 0.6);
-	if (!fs.existsSync(FONT_PATH)) throw new Error(`FONT_NOT_FOUND: expected font at ${FONT_PATH}.`);
+	const fadeInEnd = 0.6, fadeOutStart = Math.max(fadeInEnd, durationSeconds - 0.6);
+	if (!fs.existsSync(FONT_PATH)) throw new Error(`FONT_NOT_FOUND: ${FONT_PATH}`);
 	const drawtext = `drawtext=fontfile='${FONT_PATH}':text='${safeText}':fontsize=90:fontcolor=${fontColor}:` +
 		`x=(w-text_w)/2:y=(h-text_h)/2:alpha='if(lt(t,${fadeInEnd}),t/${fadeInEnd},if(gt(t,${fadeOutStart}),(${durationSeconds}-t)/0.6,1))'`;
-	await new Promise((resolve, reject) => {
-		const cmd = ffmpeg().input(`color=c=${backgroundColor}:s=1920x1080:d=${durationSeconds}:r=${fps}`).inputFormat('lavfi')
-			.videoFilters(drawtext).outputOptions(['-pix_fmt yuv420p', '-movflags +faststart']).duration(durationSeconds).output(outputPath);
-		const t = setTimeout(() => { cmd.kill('SIGKILL'); reject(new Error('RENDER_TIMEOUT: text motion exceeded 60s.')); }, 60000);
-		cmd.on('end', () => { clearTimeout(t); resolve(); }).on('error', (e) => { clearTimeout(t); reject(e); }).run();
-	});
+	await runFfmpeg((c) => c.input(`color=c=${backgroundColor}:s=${TARGET_W}x${TARGET_H}:d=${durationSeconds}:r=${TARGET_FPS}`).inputFormat('lavfi')
+		.videoFilters(drawtext).outputOptions(['-pix_fmt yuv420p', '-movflags +faststart']).duration(durationSeconds).output(outputPath), 60000, requestId);
 }
 
 // ------------------------------------------------------------ TTS
@@ -153,120 +207,243 @@ async function synthesizeChunk({ text, voice, rate, pitch, requestId, chunkIndex
 	let lastError;
 	for (let attempt = 1; attempt <= 2; attempt++) {
 		try { await tts.ttsPromise(text, outputPath); return; }
-		catch (err) { lastError = err; logEvent(requestId, `Chunk ${chunkIndex} attempt ${attempt} failed: ${err.message}`); }
+		catch (err) { lastError = err; logEvent(requestId, `TTS chunk ${chunkIndex} attempt ${attempt} failed: ${err.message}`); }
 	}
-	throw new Error(`TTS_CHUNK_FAILED: chunk ${chunkIndex} failed after 2 attempts: ${lastError.message}`);
+	throw new Error(`TTS_CHUNK_FAILED after 2 attempts: ${lastError.message}`);
 }
 
-async function concatenateAudioFiles(paths, outputPath, requestId) {
+async function concatenateAudio(paths, outputPath, requestId) {
 	if (paths.length === 1) { fs.copyFileSync(paths[0], outputPath); return; }
-	const listPath = makeTempPath(requestId, 'txt', 'concat_');
+	const listPath = outputPath + '.list.txt';
 	fs.writeFileSync(listPath, paths.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n'));
-	await new Promise((resolve, reject) => {
-		ffmpeg().input(listPath).inputOptions(['-f concat', '-safe 0']).outputOptions(['-c copy']).output(outputPath)
-			.on('end', resolve).on('error', reject).run();
-	});
-	cleanupFiles(requestId, listPath);
+	await runFfmpeg((c) => c.input(listPath).inputOptions(['-f concat', '-safe 0']).outputOptions(['-c copy']).output(outputPath), 60000, requestId);
+	fs.unlink(listPath, () => {});
 }
 
 async function renderTextToSpeech({ text, voice, rate, pitch, requestId }, outputPath) {
 	const chunks = splitTextIntoChunks(text);
-	logEvent(requestId, `TTS: ${chunks.length} chunk(s), voice=${voice}, rate=${rate}, pitch=${pitch}.`);
-	const chunkPaths = [];
+	const chunkPaths = chunks.map((_, i) => outputPath + `.part${i}.mp3`);
 	try {
-		for (let i = 0; i < chunks.length; i++) {
-			const cp = makeTempPath(requestId, 'mp3', `tts${i}_`);
-			await synthesizeChunk({ text: chunks[i], voice, rate, pitch, requestId, chunkIndex: i + 1 }, cp);
-			chunkPaths.push(cp);
-		}
-		await concatenateAudioFiles(chunkPaths, outputPath, requestId);
-	} finally { cleanupFiles(requestId, ...chunkPaths); }
+		for (let i = 0; i < chunks.length; i++) await synthesizeChunk({ text: chunks[i], voice, rate, pitch, requestId, chunkIndex: i + 1 }, chunkPaths[i]);
+		await concatenateAudio(chunkPaths, outputPath, requestId);
+	} finally { chunkPaths.forEach((p) => fs.unlink(p, () => {})); }
 }
 
-// ------------------------------------------------------------ MAIN ENDPOINT
+// ------------------------------------------------------------ VALIDATORS
+const RATE_REGEX = /^[+-]\d{1,3}%$/, PITCH_REGEX = /^[+-]\d{1,3}Hz$/, VOICE_REGEX = /^[a-z]{2,3}-[A-Z]{2}-[A-Za-z]+Neural$/i;
+const HEX_COLOR_REGEX = /^#[0-9A-Fa-f]{6}$/;
+function validColor(v, fb) { return v && HEX_COLOR_REGEX.test(v) ? v : fb; }
+
+// ============================================================
+// ENDPOINT: POST /render  (kenburns | textmotion | tts)
+// Backward compatible. If job_id+shot_id given, output is ALSO
+// persisted into that shot's job-store slot automatically.
+// ============================================================
 app.post('/render', requireApiSecret, async (req, res) => {
 	const requestId = crypto.randomBytes(4).toString('hex');
-	const { type } = req.body;
-	logEvent(requestId, `Incoming request, type="${type}"`);
-
-	if (!type) return res.status(400).json({ error: 'VALIDATION_ERROR: "type" is required (kenburns | textmotion | tts).', request_id: requestId });
+	const { type, job_id, shot_id } = req.body;
+	if (!type) return res.status(400).json({ error: 'VALIDATION_ERROR: "type" is required.', request_id: requestId });
 
 	const isTts = type === 'tts';
-	const activeCount = isTts ? activeTtsJobs : activeVideoRenders;
-	const maxCount = isTts ? MAX_CONCURRENT_TTS : MAX_CONCURRENT_VIDEO_RENDERS;
-	if (activeCount >= maxCount) return res.status(429).json({ error: 'SERVER_BUSY: max concurrent jobs reached. Retry shortly.', request_id: requestId });
-	if (isTts) activeTtsJobs++; else activeVideoRenders++;
+	const gate = isTts ? ttsGate : renderGate;
+	if (!gate.tryEnter()) return busyResponse(res, requestId);
 
-	const outputPath = makeTempPath(requestId, isTts ? 'mp3' : 'mp4', 'out_');
+	const outputPath = path.join(os.tmpdir(), `render_${requestId}.${isTts ? 'mp3' : 'mp4'}`);
 
 	try {
 		if (type === 'kenburns') {
 			const { image_url, image_base64, duration, zoom, pan } = req.body;
-
-			if (!image_url && !image_base64) {
-				return res.status(400).json({ error: 'VALIDATION_ERROR: provide either "image_url" or "image_base64".', request_id: requestId });
-			}
-			if (image_url && !isValidHttpUrl(image_url)) {
-				return res.status(400).json({ error: 'VALIDATION_ERROR: "image_url" must be a valid http(s) URL.', request_id: requestId });
-			}
-			if (image_base64 && !isValidBase64(image_base64)) {
-				return res.status(400).json({ error: 'VALIDATION_ERROR: "image_base64" does not look like valid base64 data.', request_id: requestId });
-			}
-
+			if (!image_url && !image_base64) return res.status(400).json({ error: 'VALIDATION_ERROR: provide "image_url" or "image_base64".', request_id: requestId });
 			await renderKenBurns({
-				imageUrl: image_url,
-				imageBase64: image_base64,
+				imageUrl: image_url, imageBase64: image_base64,
 				durationSeconds: Math.max(2, Math.min(20, Number(duration) || 6)),
 				zoomDirection: zoom === 'out' ? 'out' : 'in',
-				panDirection: ['right', 'left', 'top', 'bottom'].includes(pan) ? pan : 'right',
-				requestId
+				panDirection: ['right', 'left', 'top', 'bottom'].includes(pan) ? pan : 'right', requestId
 			}, outputPath);
 
 		} else if (type === 'textmotion') {
 			const { text, duration, background_color, font_color } = req.body;
-			if (!text || String(text).trim().length === 0) return res.status(400).json({ error: 'VALIDATION_ERROR: "text" is required.', request_id: requestId });
-			if (String(text).length > MAX_TEXT_LENGTH) return res.status(400).json({ error: `VALIDATION_ERROR: "text" exceeds ${MAX_TEXT_LENGTH} chars.`, request_id: requestId });
+			if (!text?.trim()) return res.status(400).json({ error: 'VALIDATION_ERROR: "text" is required.', request_id: requestId });
 			await renderTextMotion({
 				text, durationSeconds: Math.max(2, Math.min(15, Number(duration) || 4)),
-				backgroundColor: validateColor(background_color, '#1A1A2E'), fontColor: validateColor(font_color, '#FFFFFF'), requestId
+				backgroundColor: validColor(background_color, '#1A1A2E'), fontColor: validColor(font_color, '#FFFFFF'), requestId
 			}, outputPath);
 
 		} else if (type === 'tts') {
 			const { text, voice, rate, pitch } = req.body;
-			if (!text || String(text).trim().length === 0) return res.status(400).json({ error: 'VALIDATION_ERROR: "text" is required.', request_id: requestId });
-			if (String(text).length > MAX_TTS_TEXT_LENGTH) return res.status(400).json({ error: `VALIDATION_ERROR: "text" exceeds ${MAX_TTS_TEXT_LENGTH} chars.`, request_id: requestId });
-			const safeVoice = validateVoice(voice);
-			if (!safeVoice) return res.status(400).json({ error: `VALIDATION_ERROR: "voice" must match format "xx-XX-NameNeural", got "${voice}".`, request_id: requestId });
-			await renderTextToSpeech({ text: String(text).trim(), voice: safeVoice, rate: validateRate(rate), pitch: validatePitch(pitch), requestId }, outputPath);
+			if (!text?.trim()) return res.status(400).json({ error: 'VALIDATION_ERROR: "text" is required.', request_id: requestId });
+			if (!voice || !VOICE_REGEX.test(voice)) return res.status(400).json({ error: `VALIDATION_ERROR: "voice" must match "xx-XX-NameNeural", got "${voice}".`, request_id: requestId });
+			const safeRate = rate && RATE_REGEX.test(rate) ? rate : '+0%';
+			const safePitch = pitch && PITCH_REGEX.test(pitch) ? pitch : '+0Hz';
+			await renderTextToSpeech({ text: text.trim(), voice, rate: safeRate, pitch: safePitch, requestId }, outputPath);
 
 		} else {
 			return res.status(400).json({ error: `VALIDATION_ERROR: unknown type "${type}".`, request_id: requestId });
 		}
 
-		if (!fs.existsSync(outputPath)) throw new Error('RENDER_ERROR: output file was not created.');
+		if (job_id && shot_id) {
+			ensureJobDirs(job_id);
+			const dest = isTts ? jobPath(job_id, 'audio', `${shot_id}.mp3`) : jobPath(job_id, 'assets', `${shot_id}.mp4`);
+			fs.copyFileSync(outputPath, dest);
+		}
 
 		res.setHeader('Content-Type', isTts ? 'audio/mpeg' : 'video/mp4');
-		res.setHeader('x-request-id', requestId);
 		const stream = fs.createReadStream(outputPath);
-		stream.on('error', (e) => { logEvent(requestId, `STREAM_ERROR: ${e.message}`); if (!res.headersSent) res.status(500).end(); });
+		stream.on('error', () => { if (!res.headersSent) res.status(500).end(); });
 		stream.pipe(res);
-		stream.on('close', () => cleanupFiles(requestId, outputPath));
+		stream.on('close', () => fs.unlink(outputPath, () => {}));
 
 	} catch (err) {
-		cleanupFiles(requestId, outputPath);
-		logEvent(requestId, `FAILURE: ${err.message}`);
-		if (!res.headersSent) res.status(500).json({ error: `FAILURE: ${err.message}`, request_id: requestId });
+		fs.unlink(outputPath, () => {});
+		logEvent(requestId, `RENDER_FAILURE: ${err.message}`);
+		if (!res.headersSent) res.status(500).json({ error: `RENDER_FAILURE: ${err.message}`, request_id: requestId });
 	} finally {
-		if (isTts) activeTtsJobs--; else activeVideoRenders--;
+		gate.leave();
+	}
+});
+
+// ============================================================
+// ENDPOINT: POST /store-existing
+// Stores a visual asset (video or image), already-fetched by n8n,
+// into job-scoped storage. Accepts multipart file OR a source_url.
+// kind: "video" | "image" | "subtitle"  (audio uses /render tts path above)
+// ============================================================
+app.post('/store-existing', requireApiSecret, upload.single('file'), async (req, res) => {
+	const requestId = crypto.randomBytes(4).toString('hex');
+	try {
+		const { job_id, shot_id, kind, source_url, subtitle_text } = req.body;
+		if (!job_id || !shot_id || !kind) return res.status(400).json({ error: 'VALIDATION_ERROR: "job_id", "shot_id", "kind" are required.', request_id: requestId });
+		if (!['video', 'image', 'subtitle'].includes(kind)) return res.status(400).json({ error: `VALIDATION_ERROR: unsupported kind "${kind}".`, request_id: requestId });
+
+		ensureJobDirs(job_id);
+
+		if (kind === 'subtitle') {
+			if (!subtitle_text) return res.status(400).json({ error: 'VALIDATION_ERROR: "subtitle_text" required for kind=subtitle.', request_id: requestId });
+			fs.writeFileSync(jobPath(job_id, 'subtitles', `${shot_id}.srt`), subtitle_text);
+			return res.json({ status: 'STORED', job_id, shot_id, kind, request_id: requestId });
+		}
+
+		const tempPath = path.join(os.tmpdir(), `store_${requestId}.tmp`);
+		if (req.file) {
+			fs.writeFileSync(tempPath, req.file.buffer);
+		} else if (source_url) {
+			await downloadToFile(source_url, tempPath);
+		} else {
+			return res.status(400).json({ error: 'VALIDATION_ERROR: provide a "file" upload or "source_url".', request_id: requestId });
+		}
+
+		await validateMediaFile(tempPath, kind === 'image' ? undefined : 'video'); // images validated loosely below
+		if (kind === 'image' && !fs.existsSync(tempPath)) throw new Error('FILE_INVALID: image file missing.');
+
+		const ext = kind === 'image' ? 'img' : 'mp4';
+		const dest = jobPath(job_id, 'assets', `${shot_id}.${ext}`);
+		fs.renameSync(tempPath, dest);
+
+		res.json({ status: 'STORED', job_id, shot_id, kind, request_id: requestId });
+
+	} catch (err) {
+		logEvent(requestId, `STORE_FAILURE: ${err.message}`);
+		res.status(500).json({ error: `STORE_FAILURE: ${err.message}`, request_id: requestId });
+	}
+});
+
+// ============================================================
+// ENDPOINT: POST /assemble
+// Per shot: conform visual to audio duration, mux narration audio
+// (strip original audio), burn that shot's subtitle (local-time,
+// no offset math needed). Then concat all shots (already uniform
+// codec/res/fps -> safe to -c copy concat). Narration audio only;
+// image assets auto-converted to static video of correct duration.
+// ============================================================
+app.post('/assemble', requireApiSecret, async (req, res) => {
+	const requestId = crypto.randomBytes(4).toString('hex');
+	const { job_id, shot_ids } = req.body;
+
+	if (!job_id || !Array.isArray(shot_ids) || shot_ids.length === 0) {
+		return res.status(400).json({ error: 'VALIDATION_ERROR: "job_id" and non-empty "shot_ids" array (in final order) are required.', request_id: requestId });
+	}
+	if (!assembleGate.tryEnter()) return busyResponse(res, requestId, 30);
+
+	const finalPath = jobPath(job_id, 'final', `${job_id}.mp4`);
+
+	try {
+		ensureJobDirs(job_id);
+		logEvent(requestId, `Assembling job ${job_id}: ${shot_ids.length} shots.`);
+
+		for (const shotId of shot_ids) {
+			const shotOut = jobPath(job_id, 'shots', `${shotId}.mp4`);
+			const audioPath = jobPath(job_id, 'audio', `${shotId}.mp3`);
+			const subtitlePath = jobPath(job_id, 'subtitles', `${shotId}.srt`);
+			const videoAsset = jobPath(job_id, 'assets', `${shotId}.mp4`);
+			const imageAsset = jobPath(job_id, 'assets', `${shotId}.img`);
+
+			if (!fs.existsSync(audioPath)) throw new Error(`MISSING_AUDIO: shot ${shotId} has no narration audio stored.`);
+			const targetDuration = await probeDuration(audioPath);
+
+			const hasVideo = fs.existsSync(videoAsset);
+			const hasImage = fs.existsSync(imageAsset);
+			if (!hasVideo && !hasImage) throw new Error(`MISSING_VISUAL: shot ${shotId} has no visual asset stored.`);
+
+			const normalizedVisual = shotOut + '.visual.mp4';
+			const normFilter = `scale=${TARGET_W}:${TARGET_H}:force_original_aspect_ratio=decrease,pad=${TARGET_W}:${TARGET_H}:(ow-iw)/2:(oh-ih)/2,fps=${TARGET_FPS},setsar=1`;
+
+			if (hasImage) {
+				await runFfmpeg((c) => c.input(imageAsset).loop(targetDuration).videoFilters(normFilter)
+					.outputOptions(['-pix_fmt yuv420p']).duration(targetDuration).fps(TARGET_FPS).output(normalizedVisual), 60000, requestId);
+			} else {
+				const srcDuration = await probeDuration(videoAsset);
+				if (srcDuration >= targetDuration) {
+					await runFfmpeg((c) => c.input(videoAsset).videoFilters(normFilter).outputOptions(['-pix_fmt yuv420p', '-an'])
+						.duration(targetDuration).fps(TARGET_FPS).output(normalizedVisual), 60000, requestId);
+				} else {
+					await runFfmpeg((c) => c.input(videoAsset).inputOptions(['-stream_loop -1']).videoFilters(normFilter)
+						.outputOptions(['-pix_fmt yuv420p', '-an']).duration(targetDuration).fps(TARGET_FPS).output(normalizedVisual), 60000, requestId);
+				}
+			}
+
+			let muxed = shotOut + '.muxed.mp4';
+			await runFfmpeg((c) => c.input(normalizedVisual).input(audioPath)
+				.outputOptions(['-map 0:v:0', '-map 1:a:0', '-c:v copy', '-c:a aac', '-shortest']).output(muxed), 60000, requestId);
+
+			if (fs.existsSync(subtitlePath)) {
+				const escapedSrt = subtitlePath.replace(/\\/g, '/').replace(/:/g, '\\:');
+				await runFfmpeg((c) => c.input(muxed).outputOptions([`-vf subtitles=${escapedSrt}`, '-c:a copy']).output(shotOut), 60000, requestId);
+			} else {
+				fs.renameSync(muxed, shotOut);
+			}
+
+			[normalizedVisual, muxed].forEach((p) => fs.unlink(p, () => {}));
+			logEvent(requestId, `Shot ${shotId} normalized (${targetDuration.toFixed(1)}s).`);
+		}
+
+		const listPath = jobPath(job_id, 'temp', 'concat_list.txt');
+		const listContent = shot_ids.map((id) => `file '${jobPath(job_id, 'shots', `${id}.mp4`).replace(/'/g, "'\\''")}'`).join('\n');
+		fs.writeFileSync(listPath, listContent);
+
+		await runFfmpeg((c) => c.input(listPath).inputOptions(['-f concat', '-safe 0']).outputOptions(['-c copy', '-movflags +faststart']).output(finalPath), 180000, requestId);
+
+		logEvent(requestId, `Job ${job_id} assembled successfully.`);
+
+		res.setHeader('Content-Type', 'video/mp4');
+		const stream = fs.createReadStream(finalPath);
+		stream.on('error', () => { if (!res.headersSent) res.status(500).end(); });
+		stream.pipe(res);
+		stream.on('close', () => cleanupJob(job_id));
+
+	} catch (err) {
+		logEvent(requestId, `ASSEMBLY_FAILURE: ${err.message}`);
+		if (!res.headersSent) res.status(500).json({ error: `ASSEMBLY_FAILURE: ${err.message}`, request_id: requestId });
+	} finally {
+		assembleGate.leave();
 	}
 });
 
 app.get('/health', (req, res) => {
 	ffmpeg.getAvailableFormats((err) => {
-		if (err) return res.status(503).json({ status: 'degraded', ffmpeg_available: false, error: err.message });
-		res.json({ status: 'ok', service: 'video-render-service', ffmpeg_available: true, active_video_renders: activeVideoRenders, active_tts_jobs: activeTtsJobs, time: new Date().toISOString() });
+		if (err) return res.status(503).json({ status: 'degraded', ffmpeg_available: false });
+		res.json({ status: 'ok', render_active: renderGate.active, tts_active: ttsGate.active, assemble_active: assembleGate.active, time: new Date().toISOString() });
 	});
 });
 
-const server = app.listen(PORT, () => console.log(`Render service listening on port ${PORT}`));
-process.on('SIGTERM', () => { server.close(() => process.exit(0)); });
+const server = app.listen(PORT, () => console.log(`v8 render/assembly service on port ${PORT}`));
+process.on('SIGTERM', () => server.close(() => process.exit(0)));
