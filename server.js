@@ -1,5 +1,5 @@
 // ============================================================
-// UNIVERSAL VIDEO & AUDIO RENDER + ASSEMBLY MICROSERVICE — v8
+// UNIVERSAL VIDEO & AUDIO RENDER + ASSEMBLY MICROSERVICE — v9
 // Job/shot-scoped storage, per-shot mux+subtitle-burn+normalize,
 // codec-safe final concatenation. Replaces Shotstack entirely.
 // ============================================================
@@ -34,7 +34,6 @@ function requireApiSecret(req, res, next) {
 
 function logEvent(id, msg) { console.log(`[${new Date().toISOString()}] [${id}] ${msg}`); }
 
-// Basic SSRF guard: refuse to fetch from private/loopback hosts.
 const PRIVATE_HOST_REGEX = /^(localhost|127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.0\.0\.0|::1)/i;
 function isSafeExternalUrl(url) {
 	try {
@@ -55,6 +54,10 @@ function safeId(id) {
 	return clean;
 }
 
+function safeId_or_file(s) {
+	return String(s).replace(/[^a-zA-Z0-9_.\-]/g, '_');
+}
+
 function jobPath(jobId, ...segments) {
 	const base = path.join(JOB_STORE_ROOT, safeId(jobId));
 	const full = path.join(base, ...segments.map(safeId_or_file));
@@ -62,10 +65,6 @@ function jobPath(jobId, ...segments) {
 	const resolvedFull = path.resolve(full);
 	if (!resolvedFull.startsWith(resolvedBase)) throw new Error('PATH_TRAVERSAL_BLOCKED');
 	return resolvedFull;
-}
-function safeId_or_file(s) {
-	// allows subfolder names and "shotid.ext" filenames, still strips traversal chars
-	return String(s).replace(/[^a-zA-Z0-9_.\-]/g, '_');
 }
 
 function ensureJobDirs(jobId) {
@@ -76,11 +75,10 @@ function ensureJobDirs(jobId) {
 }
 
 function cleanupJob(jobId) {
-	const base = jobPath(jobId);
-	fs.rm(base, { recursive: true, force: true }, () => {});
+	fs.rm(jobPath(jobId), { recursive: true, force: true }, () => {});
 }
 
-// ------------------------------------------------------------ BOUNDED CONCURRENCY (semaphore + 429)
+// ------------------------------------------------------------ BOUNDED CONCURRENCY
 function makeGate(maxConcurrent) {
 	let active = 0;
 	return {
@@ -91,7 +89,7 @@ function makeGate(maxConcurrent) {
 }
 const renderGate = makeGate(2);
 const ttsGate = makeGate(3);
-const assembleGate = makeGate(1); // assembly is heavy; one at a time
+const assembleGate = makeGate(1);
 
 function busyResponse(res, requestId, retryAfterSeconds = 10) {
 	res.setHeader('Retry-After', String(retryAfterSeconds));
@@ -123,17 +121,27 @@ function probeDuration(filePath) {
 	});
 }
 
+// expectKind: 'video' | 'audio' | 'subtitle' | 'image'
 function validateMediaFile(filePath, expectKind) {
 	return new Promise((resolve, reject) => {
 		if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
 			return reject(new Error('FILE_INVALID: missing or empty file.'));
 		}
-		if (expectKind === 'subtitle') return resolve(true); // text file, no ffprobe needed
+		if (expectKind === 'subtitle') return resolve(true); // plain text, no ffprobe needed
+
 		ffmpeg.ffprobe(filePath, (err, data) => {
 			if (err) return reject(new Error(`FILE_INVALID: not a readable media file (${err.message}).`));
 			const streams = data?.streams || [];
-			if (expectKind === 'video' && !streams.some((s) => s.codec_type === 'video')) return reject(new Error('FILE_INVALID: no video stream found.'));
-			if (expectKind === 'audio' && !streams.some((s) => s.codec_type === 'audio')) return reject(new Error('FILE_INVALID: no audio stream found.'));
+			if (expectKind === 'video' && !streams.some((s) => s.codec_type === 'video')) {
+				return reject(new Error('FILE_INVALID: no video stream found.'));
+			}
+			if (expectKind === 'audio' && !streams.some((s) => s.codec_type === 'audio')) {
+				return reject(new Error('FILE_INVALID: no audio stream found.'));
+			}
+			if (expectKind === 'image' && !streams.some((s) => s.codec_type === 'video')) {
+				// still images report as a single "video" stream in ffprobe
+				return reject(new Error('FILE_INVALID: not a readable image.'));
+			}
 			resolve(true);
 		});
 	});
@@ -142,16 +150,15 @@ function validateMediaFile(filePath, expectKind) {
 async function downloadToFile(url, destPath, timeoutMs = 30000) {
 	if (!isSafeExternalUrl(url)) throw new Error('UNSAFE_URL: refused to fetch this URL.');
 	const res = await axios({ method: 'GET', url, responseType: 'stream', timeout: timeoutMs, maxContentLength: 100 * 1024 * 1024, maxRedirects: 5 });
-	const contentType = res.headers['content-type'] || '';
 	await new Promise((resolve, reject) => {
 		const w = fs.createWriteStream(destPath);
 		res.data.pipe(w);
 		w.on('finish', resolve); w.on('error', reject); res.data.on('error', reject);
 	});
-	return contentType;
+	return res.headers['content-type'] || '';
 }
 
-// ------------------------------------------------------------ KEN BURNS / TEXT MOTION (unchanged behavior, now job-aware)
+// ------------------------------------------------------------ KEN BURNS
 function buildKenBurnsFilter({ zoomDirection, panDirection, durationSeconds, fps }) {
 	const totalFrames = Math.round(durationSeconds * fps);
 	const zoomExpr = zoomDirection === 'out' ? `if(lte(zoom,1.0),1.3,max(1.001,zoom-0.0008))` : `min(zoom+0.0008,1.3)`;
@@ -175,6 +182,7 @@ async function renderKenBurns({ imageUrl, imageBase64, durationSeconds, zoomDire
 	fs.unlink(inputPath, () => {});
 }
 
+// ------------------------------------------------------------ TEXT MOTION
 function escapeForDrawtext(t) { return String(t).replace(/\\/g, '\\\\').replace(/:/g, '\\:').replace(/'/g, '\u2019').replace(/%/g, '\\%'); }
 
 async function renderTextMotion({ text, durationSeconds, backgroundColor, fontColor, requestId }, outputPath) {
@@ -236,8 +244,6 @@ function validColor(v, fb) { return v && HEX_COLOR_REGEX.test(v) ? v : fb; }
 
 // ============================================================
 // ENDPOINT: POST /render  (kenburns | textmotion | tts)
-// Backward compatible. If job_id+shot_id given, output is ALSO
-// persisted into that shot's job-store slot automatically.
 // ============================================================
 app.post('/render', requireApiSecret, async (req, res) => {
 	const requestId = crypto.randomBytes(4).toString('hex');
@@ -304,9 +310,7 @@ app.post('/render', requireApiSecret, async (req, res) => {
 
 // ============================================================
 // ENDPOINT: POST /store-existing
-// Stores a visual asset (video or image), already-fetched by n8n,
-// into job-scoped storage. Accepts multipart file OR a source_url.
-// kind: "video" | "image" | "subtitle"  (audio uses /render tts path above)
+// kind: "video" | "image" | "subtitle"
 // ============================================================
 app.post('/store-existing', requireApiSecret, upload.single('file'), async (req, res) => {
 	const requestId = crypto.randomBytes(4).toString('hex');
@@ -332,8 +336,7 @@ app.post('/store-existing', requireApiSecret, upload.single('file'), async (req,
 			return res.status(400).json({ error: 'VALIDATION_ERROR: provide a "file" upload or "source_url".', request_id: requestId });
 		}
 
-		await validateMediaFile(tempPath, kind === 'image' ? undefined : 'video'); // images validated loosely below
-		if (kind === 'image' && !fs.existsSync(tempPath)) throw new Error('FILE_INVALID: image file missing.');
+		await validateMediaFile(tempPath, kind === 'image' ? 'image' : 'video');
 
 		const ext = kind === 'image' ? 'img' : 'mp4';
 		const dest = jobPath(job_id, 'assets', `${shot_id}.${ext}`);
@@ -349,11 +352,6 @@ app.post('/store-existing', requireApiSecret, upload.single('file'), async (req,
 
 // ============================================================
 // ENDPOINT: POST /assemble
-// Per shot: conform visual to audio duration, mux narration audio
-// (strip original audio), burn that shot's subtitle (local-time,
-// no offset math needed). Then concat all shots (already uniform
-// codec/res/fps -> safe to -c copy concat). Narration audio only;
-// image assets auto-converted to static video of correct duration.
 // ============================================================
 app.post('/assemble', requireApiSecret, async (req, res) => {
 	const requestId = crypto.randomBytes(4).toString('hex');
@@ -401,7 +399,7 @@ app.post('/assemble', requireApiSecret, async (req, res) => {
 				}
 			}
 
-			let muxed = shotOut + '.muxed.mp4';
+			const muxed = shotOut + '.muxed.mp4';
 			await runFfmpeg((c) => c.input(normalizedVisual).input(audioPath)
 				.outputOptions(['-map 0:v:0', '-map 1:a:0', '-c:v copy', '-c:a aac', '-shortest']).output(muxed), 60000, requestId);
 
@@ -438,6 +436,15 @@ app.post('/assemble', requireApiSecret, async (req, res) => {
 	}
 });
 
+// Multer upload errors otherwise return an HTML page instead of
+// JSON — this keeps every error response from this service consistent.
+app.use((err, req, res, next) => {
+	if (err && err.name === 'MulterError') {
+		return res.status(400).json({ error: `UPLOAD_ERROR: ${err.message}` });
+	}
+	next(err);
+});
+
 app.get('/health', (req, res) => {
 	ffmpeg.getAvailableFormats((err) => {
 		if (err) return res.status(503).json({ status: 'degraded', ffmpeg_available: false });
@@ -445,5 +452,5 @@ app.get('/health', (req, res) => {
 	});
 });
 
-const server = app.listen(PORT, () => console.log(`v8 render/assembly service on port ${PORT}`));
+const server = app.listen(PORT, () => console.log(`v9 render/assembly service on port ${PORT}`));
 process.on('SIGTERM', () => server.close(() => process.exit(0)));
