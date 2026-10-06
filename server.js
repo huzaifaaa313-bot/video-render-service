@@ -17,7 +17,21 @@ require('dotenv').config();
 
 const app = express();
 app.use(express.json({ limit: '15mb' }));
-const upload = multer({ limits: { fileSize: 100 * 1024 * 1024 } }); // 100MB cap per file
+
+// ------------------------------------------------------------
+// MULTER DISK STORAGE
+// Uploaded files are written directly to disk instead of RAM.
+// This prevents large stock-footage uploads from filling RAM.
+// ------------------------------------------------------------
+const multerStorage = multer.diskStorage({
+	destination: (req, file, cb) => cb(null, os.tmpdir()),
+	filename: (req, file, cb) => cb(null, `upload_${crypto.randomBytes(6).toString('hex')}`)
+});
+
+const upload = multer({
+	storage: multerStorage,
+	limits: { fileSize: 100 * 1024 * 1024 }
+}); // 100MB cap per file
 
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.RENDER_API_SECRET;
@@ -127,7 +141,7 @@ function validateMediaFile(filePath, expectKind) {
 		if (!fs.existsSync(filePath) || fs.statSync(filePath).size === 0) {
 			return reject(new Error('FILE_INVALID: missing or empty file.'));
 		}
-		if (expectKind === 'subtitle') return resolve(true); // plain text, no ffprobe needed
+		if (expectKind === 'subtitle') return resolve(true);
 
 		ffmpeg.ffprobe(filePath, (err, data) => {
 			if (err) return reject(new Error(`FILE_INVALID: not a readable media file (${err.message}).`));
@@ -139,7 +153,6 @@ function validateMediaFile(filePath, expectKind) {
 				return reject(new Error('FILE_INVALID: no audio stream found.'));
 			}
 			if (expectKind === 'image' && !streams.some((s) => s.codec_type === 'video')) {
-				// still images report as a single "video" stream in ffprobe
 				return reject(new Error('FILE_INVALID: not a readable image.'));
 			}
 			resolve(true);
@@ -329,7 +342,7 @@ app.post('/store-existing', requireApiSecret, upload.single('file'), async (req,
 
 		const tempPath = path.join(os.tmpdir(), `store_${requestId}.tmp`);
 		if (req.file) {
-			fs.writeFileSync(tempPath, req.file.buffer);
+			fs.renameSync(req.file.path, tempPath);
 		} else if (source_url) {
 			await downloadToFile(source_url, tempPath);
 		} else {
